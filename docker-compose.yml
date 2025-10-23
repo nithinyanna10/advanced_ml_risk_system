@@ -1,0 +1,522 @@
+# Advanced ML Risk System - Docker Compose Configuration
+# Multi-language, multi-service architecture
+# 
+# Technologies: Docker, Kubernetes, Microservices
+# Author: Nithin Yanna
+# Date: 2025
+
+version: '3.8'
+
+services:
+  # =====================================================
+  # DATABASE SERVICES
+  # =====================================================
+  
+  postgres:
+    image: postgres:15-alpine
+    container_name: risk-postgres
+    environment:
+      POSTGRES_DB: risk_assessment
+      POSTGRES_USER: risk_user
+      POSTGRES_PASSWORD: risk_password
+      POSTGRES_INITDB_ARGS: "--encoding=UTF-8 --lc-collate=C --lc-ctype=C"
+    ports:
+      - "5432:5432"
+    volumes:
+      - postgres_data:/var/lib/postgresql/data
+      - ./src/sql/queries:/docker-entrypoint-initdb.d
+    networks:
+      - risk-network
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U risk_user -d risk_assessment"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  clickhouse:
+    image: clickhouse/clickhouse-server:latest
+    container_name: risk-clickhouse
+    environment:
+      CLICKHOUSE_DB: risk_analytics
+      CLICKHOUSE_USER: analytics_user
+      CLICKHOUSE_PASSWORD: analytics_password
+    ports:
+      - "8123:8123"
+      - "9000:9000"
+    volumes:
+      - clickhouse_data:/var/lib/clickhouse
+      - ./config/clickhouse:/etc/clickhouse-server
+    networks:
+      - risk-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:8123/ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  redis:
+    image: redis:7-alpine
+    container_name: risk-redis
+    ports:
+      - "6379:6379"
+    volumes:
+      - redis_data:/data
+    networks:
+      - risk-network
+    healthcheck:
+      test: ["CMD", "redis-cli", "ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  # =====================================================
+  # MESSAGE QUEUE SERVICES
+  # =====================================================
+  
+  kafka:
+    image: confluentinc/cp-kafka:latest
+    container_name: risk-kafka
+    environment:
+      KAFKA_BROKER_ID: 1
+      KAFKA_ZOOKEEPER_CONNECT: zookeeper:2181
+      KAFKA_ADVERTISED_LISTENERS: PLAINTEXT://localhost:9092
+      KAFKA_OFFSETS_TOPIC_REPLICATION_FACTOR: 1
+      KAFKA_AUTO_CREATE_TOPICS_ENABLE: true
+      KAFKA_NUM_PARTITIONS: 3
+      KAFKA_DEFAULT_REPLICATION_FACTOR: 1
+    ports:
+      - "9092:9092"
+    volumes:
+      - kafka_data:/var/lib/kafka/data
+    networks:
+      - risk-network
+    depends_on:
+      - zookeeper
+    healthcheck:
+      test: ["CMD", "kafka-topics", "--bootstrap-server", "localhost:9092", "--list"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+
+  zookeeper:
+    image: confluentinc/cp-zookeeper:latest
+    container_name: risk-zookeeper
+    environment:
+      ZOOKEEPER_CLIENT_PORT: 2181
+      ZOOKEEPER_TICK_TIME: 2000
+    ports:
+      - "2181:2181"
+    volumes:
+      - zookeeper_data:/var/lib/zookeeper/data
+    networks:
+      - risk-network
+
+  # =====================================================
+  # MACHINE LEARNING SERVICES
+  # =====================================================
+  
+  ml-service:
+    build:
+      context: ./src/python
+      dockerfile: Dockerfile
+    container_name: risk-ml-service
+    environment:
+      - DATABASE_URL=postgresql://risk_user:risk_password@postgres:5432/risk_assessment
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BROKERS=kafka:9092
+      - MLFLOW_TRACKING_URI=http://mlflow:5000
+      - MODEL_REGISTRY_URI=http://mlflow:5000
+    ports:
+      - "8081:8080"
+    volumes:
+      - ./src/python:/app
+      - ml_models:/app/models
+      - ml_data:/app/data
+    networks:
+      - risk-network
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - mlflow
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  mlflow:
+    image: python:3.9-slim
+    container_name: risk-mlflow
+    environment:
+      - MLFLOW_BACKEND_STORE_URI=postgresql://risk_user:risk_password@postgres:5432/risk_assessment
+      - MLFLOW_DEFAULT_ARTIFACT_ROOT=/mlflow/artifacts
+    ports:
+      - "5000:5000"
+    volumes:
+      - mlflow_data:/mlflow/artifacts
+    networks:
+      - risk-network
+    depends_on:
+      - postgres
+    command: >
+      bash -c "
+        pip install mlflow psycopg2-binary &&
+        mlflow server 
+        --backend-store-uri postgresql://risk_user:risk_password@postgres:5432/risk_assessment 
+        --default-artifact-root /mlflow/artifacts 
+        --host 0.0.0.0 
+        --port 5000
+      "
+
+  # =====================================================
+  # API SERVICES
+  # =====================================================
+  
+  risk-api:
+    build:
+      context: ./src/go
+      dockerfile: Dockerfile
+    container_name: risk-api
+    environment:
+      - DATABASE_URL=postgresql://risk_user:risk_password@postgres:5432/risk_assessment
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BROKERS=kafka:9092
+      - ML_SERVICE_URL=http://ml-service:8080
+    ports:
+      - "8080:8080"
+    volumes:
+      - ./src/go:/app
+    networks:
+      - risk-network
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+      - ml-service
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  java-service:
+    build:
+      context: ./src/java
+      dockerfile: Dockerfile
+    container_name: risk-java-service
+    environment:
+      - SPRING_DATASOURCE_URL=jdbc:postgresql://postgres:5432/risk_assessment
+      - SPRING_DATASOURCE_USERNAME=risk_user
+      - SPRING_DATASOURCE_PASSWORD=risk_password
+      - SPRING_REDIS_HOST=redis
+      - SPRING_REDIS_PORT=6379
+      - KAFKA_BOOTSTRAP_SERVERS=kafka:9092
+    ports:
+      - "8082:8080"
+    volumes:
+      - ./src/java:/app
+    networks:
+      - risk-network
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/actuator/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # FRONTEND SERVICES
+  # =====================================================
+  
+  frontend:
+    build:
+      context: ./src/javascript/frontend
+      dockerfile: Dockerfile
+    container_name: risk-frontend
+    environment:
+      - REACT_APP_API_URL=http://localhost:8080
+      - REACT_APP_WS_URL=ws://localhost:8080/ws
+    ports:
+      - "3000:3000"
+    volumes:
+      - ./src/javascript/frontend:/app
+      - /app/node_modules
+    networks:
+      - risk-network
+    depends_on:
+      - risk-api
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3000"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # DATA PROCESSING SERVICES
+  # =====================================================
+  
+  spark-master:
+    image: bitnami/spark:latest
+    container_name: risk-spark-master
+    environment:
+      - SPARK_MODE=master
+      - SPARK_RPC_AUTHENTICATION_ENABLED=no
+      - SPARK_RPC_ENCRYPTION_ENABLED=no
+      - SPARK_LOCAL_STORAGE_ENCRYPTION_ENABLED=no
+      - SPARK_SSL_ENABLED=no
+    ports:
+      - "8083:8080"
+      - "7077:7077"
+    volumes:
+      - ./src/scala:/app
+      - spark_data:/opt/bitnami/spark
+    networks:
+      - risk-network
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  spark-worker:
+    image: bitnami/spark:latest
+    container_name: risk-spark-worker
+    environment:
+      - SPARK_MODE=worker
+      - SPARK_MASTER_URL=spark://spark-master:7077
+      - SPARK_WORKER_MEMORY=2G
+      - SPARK_WORKER_CORES=2
+    ports:
+      - "8084:8081"
+    volumes:
+      - ./src/scala:/app
+      - spark_data:/opt/bitnami/spark
+    networks:
+      - risk-network
+    depends_on:
+      - spark-master
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8081"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # MONITORING SERVICES
+  # =====================================================
+  
+  prometheus:
+    image: prom/prometheus:latest
+    container_name: risk-prometheus
+    ports:
+      - "9090:9090"
+    volumes:
+      - ./config/prometheus:/etc/prometheus
+      - prometheus_data:/prometheus
+    networks:
+      - risk-network
+    command:
+      - '--config.file=/etc/prometheus/prometheus.yml'
+      - '--storage.tsdb.path=/prometheus'
+      - '--web.console.libraries=/etc/prometheus/console_libraries'
+      - '--web.console.templates=/etc/prometheus/consoles'
+      - '--web.enable-lifecycle'
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:9090/-/healthy"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  grafana:
+    image: grafana/grafana:latest
+    container_name: risk-grafana
+    environment:
+      - GF_SECURITY_ADMIN_PASSWORD=admin
+      - GF_USERS_ALLOW_SIGN_UP=false
+    ports:
+      - "3001:3000"
+    volumes:
+      - grafana_data:/var/lib/grafana
+      - ./config/grafana:/etc/grafana/provisioning
+    networks:
+      - risk-network
+    depends_on:
+      - prometheus
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:3000/api/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  elasticsearch:
+    image: docker.elastic.co/elasticsearch/elasticsearch:8.8.0
+    container_name: risk-elasticsearch
+    environment:
+      - discovery.type=single-node
+      - xpack.security.enabled=false
+      - "ES_JAVA_OPTS=-Xms512m -Xmx512m"
+    ports:
+      - "9200:9200"
+    volumes:
+      - elasticsearch_data:/usr/share/elasticsearch/data
+    networks:
+      - risk-network
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:9200/_cluster/health || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  kibana:
+    image: docker.elastic.co/kibana/kibana:8.8.0
+    container_name: risk-kibana
+    environment:
+      - ELASTICSEARCH_HOSTS=http://elasticsearch:9200
+    ports:
+      - "5601:5601"
+    volumes:
+      - ./config/kibana:/usr/share/kibana/config
+    networks:
+      - risk-network
+    depends_on:
+      - elasticsearch
+    healthcheck:
+      test: ["CMD-SHELL", "curl -f http://localhost:5601/api/status || exit 1"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # R ANALYTICS SERVICE
+  # =====================================================
+  
+  r-analytics:
+    build:
+      context: ./src/r
+      dockerfile: Dockerfile
+    container_name: risk-r-analytics
+    environment:
+      - DATABASE_URL=postgresql://risk_user:risk_password@postgres:5432/risk_assessment
+      - REDIS_URL=redis://redis:6379
+    ports:
+      - "3838:3838"
+    volumes:
+      - ./src/r:/app
+      - r_data:/app/data
+    networks:
+      - risk-network
+    depends_on:
+      - postgres
+      - redis
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:3838"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # RUST PERFORMANCE SERVICE
+  # =====================================================
+  
+  rust-service:
+    build:
+      context: ./src/rust
+      dockerfile: Dockerfile
+    container_name: risk-rust-service
+    environment:
+      - DATABASE_URL=postgresql://risk_user:risk_password@postgres:5432/risk_assessment
+      - REDIS_URL=redis://redis:6379
+      - KAFKA_BROKERS=kafka:9092
+    ports:
+      - "8085:8080"
+    volumes:
+      - ./src/rust:/app
+    networks:
+      - risk-network
+    depends_on:
+      - postgres
+      - redis
+      - kafka
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8080/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # LOAD BALANCER
+  # =====================================================
+  
+  nginx:
+    image: nginx:alpine
+    container_name: risk-nginx
+    ports:
+      - "80:80"
+      - "443:443"
+    volumes:
+      - ./config/nginx:/etc/nginx/conf.d
+      - ./ssl:/etc/nginx/ssl
+    networks:
+      - risk-network
+    depends_on:
+      - risk-api
+      - frontend
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost/health"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # INFRASTRUCTURE SERVICES
+  # =====================================================
+  
+  jaeger:
+    image: jaegertracing/all-in-one:latest
+    container_name: risk-jaeger
+    environment:
+      - COLLECTOR_OTLP_ENABLED=true
+    ports:
+      - "16686:16686"
+      - "14268:14268"
+    networks:
+      - risk-network
+    healthcheck:
+      test: ["CMD", "wget", "--no-verbose", "--tries=1", "--spider", "http://localhost:16686"]
+      interval: 30s
+      timeout: 10s
+      retries: 3
+
+  # =====================================================
+  # VOLUMES
+  # =====================================================
+
+volumes:
+  postgres_data:
+  clickhouse_data:
+  redis_data:
+  kafka_data:
+  zookeeper_data:
+  ml_models:
+  ml_data:
+  mlflow_data:
+  spark_data:
+  prometheus_data:
+  grafana_data:
+  elasticsearch_data:
+  r_data:
+
+# =====================================================
+# NETWORKS
+# =====================================================
+
+networks:
+  risk-network:
+    driver: bridge
+    ipam:
+      config:
+        - subnet: 172.20.0.0/16
